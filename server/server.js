@@ -1,3 +1,4 @@
+// server/server.js (更新版本)
 const path = require('path');
 const dotenv = require('dotenv');
 
@@ -41,21 +42,32 @@ app.use(cookieParser());
 // 全域 Rate Limiting
 app.use('/api/', rateLimiters.api);
 
+// API 路由
+const authRoutes = require('./routes/auth');
+const adminRoutes = require('./routes/admin');
+const proposalRoutes = require('./routes/proposals');
+const submissionRoutes = require('./routes/submissions');
+
+app.use('/api/auth', authRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/proposals', proposalRoutes);
+app.use('/api/submissions', submissionRoutes);
+
 // 基本路由 - 測試用
 app.get('/api/test', (req, res) => {
   res.json(ResponseFormatter.success({
     message: 'Express 伺服器運行正常！',
     timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
+    environment: process.env.NODE_ENV || 'development',
+    features: {
+      authentication: true,
+      proposals: true,
+      submissions: true,
+      nda: true,
+      comments: true
+    }
   }));
 });
-// API 路由
-const authRoutes = require('./routes/auth');
-const adminRoutes = require('./routes/admin');
-
-app.use('/api/auth', authRoutes);
-app.use('/api/admin', adminRoutes);
-
 
 // 健康檢查端點
 app.get('/api/health', async (req, res) => {
@@ -64,49 +76,44 @@ app.get('/api/health', async (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     database: database.isConnected() ? 'connected' : 'disconnected',
-    environment: process.env.NODE_ENV || 'development'
+    memory: process.memoryUsage(),
+    version: process.env.npm_package_version || '1.0.0'
   };
-
-  res.json(ResponseFormatter.success(healthInfo, '系統運行正常'));
+  
+  res.json(ResponseFormatter.success(healthInfo));
 });
 
 // 404 處理
 app.use('/api/*', (req, res) => {
   res.status(404).json(
-    ResponseFormatter.error('NOT_FOUND', '找不到請求的資源', null, 404)
+    ResponseFormatter.error('NOT_FOUND', 'API 端點不存在', null, 404)
   );
 });
 
 // 全域錯誤處理
 app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-
-  // MongoDB 驗證錯誤
+  console.error('Global error:', error);
+  
   if (error.name === 'ValidationError') {
-    const errors = Object.values(error.errors).map(err => err.message);
     return res.status(400).json(
-      ResponseFormatter.error('VALIDATION_ERROR', '資料驗證失敗', errors, 400)
+      ResponseFormatter.error('VALIDATION_ERROR', '資料驗證失敗', error.errors, 400)
     );
   }
-
-  // MongoDB 重複鍵錯誤
+  
+  if (error.name === 'CastError') {
+    return res.status(400).json(
+      ResponseFormatter.error('INVALID_ID', '無效的資源ID', null, 400)
+    );
+  }
+  
   if (error.code === 11000) {
-    const field = Object.keys(error.keyValue)[0];
-    return res.status(400).json(
-      ResponseFormatter.error('DUPLICATE_ERROR', `${field} 已存在`, null, 400)
+    return res.status(409).json(
+      ResponseFormatter.error('DUPLICATE_ERROR', '資料重複', error.keyValue, 409)
     );
   }
-
-  // JWT 錯誤
-  if (error.name === 'JsonWebTokenError') {
-    return res.status(401).json(
-      ResponseFormatter.error('INVALID_TOKEN', '無效的認證令牌', null, 401)
-    );
-  }
-
-  // 預設錯誤
+  
   res.status(500).json(
-    ResponseFormatter.error('SERVER_ERROR', '伺服器內部錯誤', null, 500)
+    ResponseFormatter.error('SERVER_ERROR', '內部伺服器錯誤', null, 500)
   );
 });
 
@@ -115,23 +122,26 @@ const startServer = async () => {
   try {
     // 連接資料庫
     await database.connect();
-
+    console.log('✅ MongoDB 連接成功');
+    
     // 啟動伺服器
     app.listen(PORT, () => {
       console.log(`🚀 Express 伺服器運行在 http://localhost:${PORT}`);
       console.log(`📁 環境: ${process.env.NODE_ENV || 'development'}`);
       console.log(`🗄️ 資料庫: ${database.isConnected() ? '已連接' : '未連接'}`);
+      console.log(`📡 API 功能:`);
+      console.log(`   - 認證系統: /api/auth`);
+      console.log(`   - 管理員功能: /api/admin`);
+      console.log(`   - 提案管理: /api/proposals`);
+      console.log(`   - 互動系統: /api/submissions`);
+      console.log(`   - 健康檢查: /api/health`);
     });
-
   } catch (error) {
     console.error('❌ 伺服器啟動失敗:', error);
     process.exit(1);
   }
 };
 
-// 啟動應用程式
-if (require.main === module) {
-  startServer();
-}
+startServer();
 
 module.exports = app;

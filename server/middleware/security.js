@@ -1,7 +1,6 @@
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { body, validationResult } = require('express-validator');
-
 // Rate Limiting 設定
 const createRateLimiter = (windowMs, max, message) => {
   return rateLimit({
@@ -21,16 +20,27 @@ const createRateLimiter = (windowMs, max, message) => {
 
 // 不同等級的 Rate Limiting
 const rateLimiters = {
-  // 登入限制：每15分鐘最多5次嘗試
-  login: createRateLimiter(15 * 60 * 1000, 5, '登入嘗試次數過多，請稍後再試'),
+  // 登入限制：開發環境寬鬆，生產環境嚴格
+  login: createRateLimiter(
+    15 * 60 * 1000, // 15分鐘
+    process.env.NODE_ENV === 'development' ? 50 : 5, // 開發50次，生產5次
+    '登入嘗試次數過多，請稍後再試'
+  ),
   
-  // API限制：每分鐘最多100次請求
-  api: createRateLimiter(60 * 1000, 100, 'API請求頻率過高'),
+  // API限制：開發環境寬鬆
+  api: createRateLimiter(
+    60 * 1000, // 1分鐘
+    process.env.NODE_ENV === 'development' ? 1000 : 100, // 開發1000次，生產100次
+    'API請求頻率過高'
+  ),
   
-  // 一般請求：每分鐘最多200次
-  general: createRateLimiter(60 * 1000, 200, '請求頻率過高')
+  // 一般請求：開發環境寬鬆
+  general: createRateLimiter(
+    60 * 1000, // 1分鐘
+    process.env.NODE_ENV === 'development' ? 2000 : 200, // 開發2000次，生產200次
+    '請求頻率過高'
+  )
 };
-
 // 安全標頭設定
 const securityHeaders = helmet({
   contentSecurityPolicy: {
