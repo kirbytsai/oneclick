@@ -153,8 +153,7 @@ router.get('/',
     }
   }
 );
-
-// 獲取單個提案詳情
+// 獲取單個提案詳情 - 修復版
 router.get('/:id',
   rateLimiters.api,
   authenticateToken,
@@ -171,8 +170,34 @@ router.get('/:id',
         );
       }
       
-      // 檢查查看權限
-      if (!proposal.canBeViewedBy(req.user)) {
+      // 修復後的權限檢查邏輯
+      let canView = false;
+      
+      // 管理員可以查看所有提案
+      if (req.user.role === 'admin') {
+        canView = true;
+      }
+      // 提案方可以查看自己的提案 - 修復 ObjectId 比較
+      else if (proposal.sellerId) {
+        // 處理 populate 後的情況 (sellerId 是對象)
+        if (proposal.sellerId._id && proposal.sellerId._id.toString() === req.user._id.toString()) {
+          canView = true;
+        }
+        // 處理未 populate 的情況 (sellerId 是 ObjectId)
+        else if (proposal.sellerId.toString() === req.user._id.toString()) {
+          canView = true;
+        }
+      }
+      // 已發布的提案買方可以查看
+      if (!canView && proposal.status === 'published' && req.user.role === 'buyer') {
+        if (proposal.visibility.isPublic) {
+          canView = true;
+        } else if (proposal.visibility.allowedBuyers.includes(req.user._id)) {
+          canView = true;
+        }
+      }
+      
+      if (!canView) {
         return res.status(403).json(
           ResponseFormatter.error('FORBIDDEN', '無權查看此提案', null, 403)
         );
