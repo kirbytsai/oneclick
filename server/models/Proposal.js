@@ -1,390 +1,391 @@
 // server/models/Proposal.js
 const mongoose = require('mongoose');
 
+// 行業選項
+const INDUSTRIES = [
+  '科技軟體', '製造業', '金融服務', '零售消費',
+  '醫療健康', '不動產', '能源環保', '教育培訓',
+  '物流運輸', '媒體娛樂', '餐飲服務', 
+  '建築工程', '農林漁業', '其他'
+];
+
+// 員工規模選項
+const EMPLOYEE_RANGES = [
+  '1-10人', '11-50人', '51-100人', '101-500人',
+  '501-1000人', '1000-5000人', '5000人以上'
+];
+
+// 交易類型
+const TRANSACTION_TYPES = [
+  'acquisition',    // 收購
+  'investment',     // 投資
+  'partnership',    // 策略合作
+  'joint_venture'   // 合資
+];
+
+// 提案狀態
+const PROPOSAL_STATUS = [
+  'draft',          // 草稿
+  'pending_review', // 待審核
+  'under_review',   // 審核中
+  'approved',       // 已核准
+  'rejected',       // 已拒絕
+  'published'       // 已發佈
+];
+
+// 買方回應狀態
+const BUYER_RESPONSE_STATUS = [
+  'sent',           // 已發送
+  'viewed',         // 已查看
+  'interested',     // 感興趣
+  'questions',      // 有疑問
+  'declined',       // 已拒絕
+  'meeting'         // 安排會議
+];
+
+// 獲利狀況選項
+const PROFITABILITY_OPTIONS = [
+  'profitable',     // 獲利中
+  'break_even',     // 損益平衡
+  'growing',        // 成長中
+  'early_stage'     // 早期階段
+];
+
+// 估值範圍預設選項 (日圓)
+const VALUATION_RANGES = [
+  { min: 10000000, max: 50000000, label: '1千萬 - 5千萬日圓' },
+  { min: 50000000, max: 100000000, label: '5千萬 - 1億日圓' },
+  { min: 100000000, max: 500000000, label: '1億 - 5億日圓' },
+  { min: 500000000, max: 1000000000, label: '5億 - 10億日圓' },
+  { min: 1000000000, max: 10000000000, label: '10億 - 100億日圓' },
+  { min: 10000000000, max: null, label: '100億日圓以上' }
+];
+
 const proposalSchema = new mongoose.Schema({
-  // 基本資訊
-  title: {
-    type: String,
+  // 基本信息
+  title: { 
+    type: String, 
+    required: true, 
+    maxlength: 100,
+    trim: true
+  },
+  industry: { 
+    type: String, 
     required: true,
-    trim: true,
-    maxlength: 200
+    enum: INDUSTRIES
   },
   
-  // 提案方
-  sellerId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true,
-    index: true
-  },
-  
-  // 行業分類
-  industry: {
-    type: String,
-    required: true,
-    enum: [
-      'IT', 'Manufacturing', 'Finance', 'Healthcare', 'Education',
-      'Retail', 'Real Estate', 'Consulting', 'Marketing', 'Logistics',
-      'Energy', 'Entertainment', 'Food & Beverage', 'Automotive', 'Other'
-    ],
-    index: true
-  },
-  
-  // 提案概述
-  summary: {
-    type: String,
-    required: true,
-    maxlength: 1000
-  },
-  
-  // 詳細內容
-  description: {
-    type: String,
-    required: true,
-    maxlength: 10000
-  },
-  
-  // 目標市場
-  targetMarket: {
-    type: String,
-    required: true,
-    maxlength: 1000
-  },
-  
-  // 商業模式
-  businessModel: {
-    revenue: {
-      type: String,
-      required: true,
-      maxlength: 1000
+  // 公司概況
+  company: {
+    name: { 
+      type: String, 
+      required: true, 
+      maxlength: 100,
+      trim: true
     },
-    timeline: {
-      type: String,
+    founded: { 
+      type: Number, 
+      required: true, 
+      min: 1800, 
+      max: new Date().getFullYear()
+    },
+    employees: { 
+      type: String, 
       required: true,
-      maxlength: 500
+      enum: EMPLOYEE_RANGES
+    },
+    location: { 
+      type: String, 
+      required: true, 
+      maxlength: 100,
+      trim: true
+    },
+    website: { 
+      type: String, 
+      maxlength: 200,
+      trim: true
+    },
+    description: { 
+      type: String, 
+      required: true, 
+      maxlength: 1000,
+      trim: true
     }
   },
   
-  // 財務資訊
+  // 執行摘要
+  executiveSummary: { 
+    type: String, 
+    required: true, 
+    minlength: 10, 
+    maxlength: 500,
+    trim: true
+  },
+  
+  // 財務亮點
   financial: {
-    // 投資需求
-    investmentRequired: {
-      amount: {
-        type: Number,
+    annualRevenue: {
+      amount: { 
+        type: Number, 
+        required: true, 
+        min: 0 
+      },
+      currency: { 
+        type: String, 
+        required: true, 
+        enum: ['JPY'], // 只支援日幣
+        default: 'JPY'
+      },
+      year: { 
+        type: Number, 
         required: true,
-        min: 0
-      },
-      currency: {
-        type: String,
-        default: 'JPY',
-        enum: ['JPY', 'USD', 'EUR']
+        min: 2000,
+        max: new Date().getFullYear()
       }
     },
-    
-    // 預期回報
-    expectedReturn: {
-      roi: {
-        type: Number,
-        min: 0,
-        max: 1000 // 1000% = 10x
+    ebitda: {
+      amount: { 
+        type: Number, 
+        min: 0 
       },
-      timeline: {
-        type: String,
-        maxlength: 200
+      margin: { 
+        type: Number, 
+        min: -100, 
+        max: 100 
       }
     },
-    
-    // 現有財務狀況
-    currentFinancials: {
-      revenue: {
-        type: Number,
-        min: 0
-      },
-      profit: {
-        type: Number
-      },
-      employees: {
-        type: Number,
-        min: 0
-      }
-    }
-  },
-  
-  // M&A 相關資訊
-  maInfo: {
-    // 公司估值
-    valuation: {
-      amount: {
-        type: Number,
-        min: 0
-      },
-      currency: {
-        type: String,
-        default: 'JPY',
-        enum: ['JPY', 'USD', 'EUR']
-      },
-      basis: {
-        type: String,
-        maxlength: 500
-      }
-    },
-    
-    // 交易類型
-    dealType: {
-      type: String,
-      enum: ['acquisition', 'merger', 'partnership', 'investment', 'joint_venture'],
-      required: true
-    },
-    
-    // 股權結構
-    ownership: {
-      shareholdersCount: {
-        type: Number,
-        min: 1
-      },
-      majorShareholders: [{
-        name: String,
-        percentage: {
-          type: Number,
-          min: 0,
-          max: 100
-        }
-      }]
-    },
-    
-    // 法務狀況
-    legal: {
-      hasLitigation: {
-        type: Boolean,
-        default: false
-      },
-      hasDebt: {
-        type: Boolean,
-        default: false
-      },
-      complianceStatus: {
-        type: String,
-        enum: ['compliant', 'minor_issues', 'major_issues'],
-        default: 'compliant'
-      }
-    }
-  },
-  
-  // 風險評估
-  risks: [{
-    category: {
-      type: String,
-      enum: ['market', 'financial', 'operational', 'legal', 'technical', 'competitive'],
-      required: true
-    },
-    description: {
-      type: String,
+    growthRate: { 
+      type: Number, 
       required: true,
-      maxlength: 500
+      min: -100,
+      max: 1000 // 最高1000%成長
     },
-    severity: {
-      type: String,
-      enum: ['low', 'medium', 'high', 'critical'],
+    profitability: { 
+      type: String, 
+      enum: PROFITABILITY_OPTIONS,
       required: true
-    },
-    mitigation: {
-      type: String,
-      maxlength: 500
     }
-  }],
+  },
+  
+  // 交易詳情
+  transaction: {
+    type: { 
+      type: String, 
+      required: true, 
+      enum: TRANSACTION_TYPES 
+    },
+    targetValuation: {
+      min: { 
+        type: Number, 
+        required: true, 
+        min: 0 
+      },
+      max: { 
+        type: Number, 
+        required: true, 
+        min: 0 
+      },
+      currency: { 
+        type: String, 
+        required: true, 
+        enum: ['JPY'],
+        default: 'JPY'
+      }
+    },
+    timeline: { 
+      type: String, 
+      required: true,
+      maxlength: 200
+    },
+    dealStructure: { 
+      type: String, 
+      maxlength: 1000 
+    }
+  },
   
   // 競爭優勢
   competitiveAdvantages: [{
     type: String,
-    maxlength: 300
+    maxlength: 200,
+    trim: true
   }],
   
-  // 附件
-  attachments: [{
-    name: {
-      type: String,
-      required: true
+  // 市場地位
+  market: {
+    position: { 
+      type: String, 
+      maxlength: 500 
     },
-    url: {
-      type: String,
-      required: true
+    size: { 
+      type: String, 
+      maxlength: 200 
     },
-    type: {
-      type: String,
-      enum: ['document', 'presentation', 'financial_statement', 'legal_document', 'other'],
-      required: true
-    },
-    uploadDate: {
-      type: Date,
-      default: Date.now
+    competitors: { 
+      type: String, 
+      maxlength: 500 
     }
+  },
+  
+  // 標籤系統
+  tags: [{
+    type: String,
+    maxlength: 50,
+    trim: true
   }],
   
   // 狀態管理
-  status: {
-    type: String,
-    enum: [
-      'draft',              // 草稿
-      'pending_review',     // 待審核
-      'approved',          // 已通過審核
-      'rejected',          // 審核未通過
-      'published',         // 已發布
-      'archived'           // 已歸檔
-    ],
-    default: 'draft',
-    index: true
+  status: { 
+    type: String, 
+    required: true, 
+    enum: PROPOSAL_STATUS,
+    default: 'draft'
   },
   
-  // 審核資訊
-  review: {
-    reviewedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User'
+  // 目標買方
+  targetBuyers: [{
+    buyerId: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: 'User' 
     },
-    reviewedAt: Date,
-    reviewComments: {
-      type: String,
-      maxlength: 1000
+    sentAt: { 
+      type: Date 
     },
-    rejectionReason: {
-      type: String,
-      maxlength: 1000
-    }
-  },
-  
-  // 統計資料
-  statistics: {
-    views: {
-      type: Number,
-      default: 0
+    status: { 
+      type: String, 
+      enum: BUYER_RESPONSE_STATUS,
+      default: 'sent'
     },
-    interests: {
-      type: Number,
-      default: 0
+    response: { 
+      type: String, 
+      maxlength: 1000 
     },
-    downloads: {
-      type: Number,
-      default: 0
-    }
-  },
-  
-  // 可見性設定
-  visibility: {
-    isPublic: {
-      type: Boolean,
-      default: false
-    },
-    allowedBuyers: [{
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User'
-    }],
-    restrictedIndustries: [{
-      type: String
-    }]
-  },
-  
-  // 標籤
-  tags: [{
-    type: String,
-    trim: true,
-    maxlength: 50
+    responseAt: Date
   }],
   
-  // 時間戳
-  createdAt: {
-    type: Date,
-    default: Date.now,
-    index: true
+  // 審核信息
+  review: {
+    reviewedBy: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: 'User' 
+    },
+    reviewedAt: Date,
+    comments: { 
+      type: String, 
+      maxlength: 1000 
+    },
+    action: {
+      type: String,
+      enum: ['approved', 'rejected', 'returned_to_draft']
+    }
   },
-  updatedAt: {
-    type: Date,
-    default: Date.now
+  
+  // 刪除申請
+  deleteRequest: {
+    requested: { 
+      type: Boolean, 
+      default: false 
+    },
+    requestedAt: Date,
+    reason: { 
+      type: String, 
+      maxlength: 500 
+    },
+    approvedBy: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: 'User' 
+    },
+    deletedAt: Date
   },
-  publishedAt: Date,
-  archivedAt: Date
-}, {
-  timestamps: true,
-  toJSON: { virtuals: true },
-  toObject: { virtuals: true }
+  
+  // 元數據
+  creator: { 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User', 
+    required: true 
+  },
+  createdAt: { 
+    type: Date, 
+    default: Date.now 
+  },
+  updatedAt: { 
+    type: Date, 
+    default: Date.now 
+  },
+  submittedAt: Date,
+  approvedAt: Date,
+  publishedAt: Date
 });
 
-// 索引
-proposalSchema.index({ sellerId: 1, status: 1 });
-proposalSchema.index({ industry: 1, status: 1 });
-proposalSchema.index({ createdAt: -1 });
-proposalSchema.index({ 'financial.investmentRequired.amount': 1 });
+// 索引設置
+proposalSchema.index({ creator: 1 });
+proposalSchema.index({ status: 1 });
+proposalSchema.index({ industry: 1 });
+proposalSchema.index({ 'targetBuyers.buyerId': 1 });
 proposalSchema.index({ tags: 1 });
-proposalSchema.index({ title: 'text', summary: 'text', description: 'text' });
+proposalSchema.index({ createdAt: -1 });
 
-// 虛擬欄位
-proposalSchema.virtual('submission', {
-  ref: 'ProposalSubmission',
-  localField: '_id',
-  foreignField: 'proposalId'
-});
-
-// 中介軟體
+// 更新時間中介軟體
 proposalSchema.pre('save', function(next) {
   this.updatedAt = new Date();
   next();
 });
 
-// 實例方法
-proposalSchema.methods.canBeViewedBy = function(user) {
-  if (!user) return false;
-  
-  // 管理員可以查看所有提案
-  if (user.role === 'admin') return true;
-  
-  // 提案方可以查看自己的提案
-  if (this.sellerId.toString() === user._id.toString()) return true;
-  
-  // 已發布的提案買方可以查看
-  if (this.status === 'published' && user.role === 'buyer') {
-    if (this.visibility.isPublic) return true;
-    if (this.visibility.allowedBuyers.includes(user._id)) return true;
+// 驗證目標估值
+proposalSchema.pre('save', function(next) {
+  if (this.transaction.targetValuation.min >= this.transaction.targetValuation.max) {
+    next(new Error('最低估值必須小於最高估值'));
   }
-  
-  return false;
+  next();
+});
+
+// 實例方法
+proposalSchema.methods.canEdit = function() {
+  return ['draft', 'rejected'].includes(this.status);
 };
 
-proposalSchema.methods.updateStatus = async function(newStatus, reviewData = {}) {
-  this.status = newStatus;
-  
-  if (reviewData.reviewedBy) {
-    this.review.reviewedBy = reviewData.reviewedBy;
-    this.review.reviewedAt = new Date();
-    this.review.reviewComments = reviewData.reviewComments;
-    this.review.rejectionReason = reviewData.rejectionReason;
-  }
-  
-  if (newStatus === 'published') {
-    this.publishedAt = new Date();
-  } else if (newStatus === 'archived') {
-    this.archivedAt = new Date();
-  }
-  
-  return this.save();
+proposalSchema.methods.canSubmit = function() {
+  return this.status === 'draft';
+};
+
+proposalSchema.methods.canApprove = function() {
+  return ['pending_review', 'under_review'].includes(this.status);
+};
+
+proposalSchema.methods.canPublish = function() {
+  return this.status === 'approved';
+};
+
+proposalSchema.methods.isOwner = function(userId) {
+  return this.creator.toString() === userId.toString();
 };
 
 // 靜態方法
-proposalSchema.statics.findByIndustry = function(industry, status = 'published') {
-  return this.find({ industry, status }).populate('sellerId', 'profile email');
+proposalSchema.statics.getIndustries = function() {
+  return INDUSTRIES;
 };
 
-proposalSchema.statics.searchProposals = function(query, filters = {}) {
-  const searchCriteria = {
-    status: 'published',
-    ...filters
-  };
-  
-  if (query) {
-    searchCriteria.$text = { $search: query };
-  }
-  
-  return this.find(searchCriteria)
-    .populate('sellerId', 'profile email')
-    .sort({ createdAt: -1 });
+proposalSchema.statics.getEmployeeRanges = function() {
+  return EMPLOYEE_RANGES;
 };
+
+proposalSchema.statics.getTransactionTypes = function() {
+  return TRANSACTION_TYPES;
+};
+
+proposalSchema.statics.getValuationRanges = function() {
+  return VALUATION_RANGES;
+};
+
+proposalSchema.statics.getStatusOptions = function() {
+  return PROPOSAL_STATUS;
+};
+
+// 導出常數供其他模組使用
+proposalSchema.statics.INDUSTRIES = INDUSTRIES;
+proposalSchema.statics.EMPLOYEE_RANGES = EMPLOYEE_RANGES;
+proposalSchema.statics.TRANSACTION_TYPES = TRANSACTION_TYPES;
+proposalSchema.statics.PROPOSAL_STATUS = PROPOSAL_STATUS;
+proposalSchema.statics.BUYER_RESPONSE_STATUS = BUYER_RESPONSE_STATUS;
+proposalSchema.statics.VALUATION_RANGES = VALUATION_RANGES;
 
 module.exports = mongoose.model('Proposal', proposalSchema);

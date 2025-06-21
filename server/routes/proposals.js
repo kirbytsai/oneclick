@@ -1,784 +1,904 @@
 // server/routes/proposals.js
 const express = require('express');
-const { body, query, param, validationResult } = require('express-validator');
 const router = express.Router();
-
 const Proposal = require('../models/Proposal');
-const ProposalSubmission = require('../models/ProposalSubmission');
+const User = require('../models/User');
 const { authenticateToken, authorize } = require('../middleware/auth');
-const { rateLimiters } = require('../middleware/security');
 const ResponseFormatter = require('../utils/response');
-const AuditLog = require('../models/AuditLog');
+const rateLimit = require('express-rate-limit');
 
-// 輸入驗證中介軟體
-const handleValidationErrors = (req, res, next) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json(
-      ResponseFormatter.error('VALIDATION_ERROR', '輸入資料有誤', errors.array(), 400)
+// Rate limiting for proposal creation
+const createProposalLimit = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 proposals per 15 minutes
+  message: ResponseFormatter.error('RATE_LIMIT', '提案創建頻率過高，請稍後再試', null, 429)
+});
+
+// ===========================================
+// 基本 CRUD 操作
+// ===========================================
+
+// 創建提案
+router.post('/', authenticateToken, authorize('seller'), createProposalLimit, async (req, res) => {
+  try {
+    const proposalData = {
+      ...req.body,
+      creator: req.user._id,
+      status: 'draft'
+    };
+
+    // 自動生成標籤
+    const autoTags = [
+      req.body.industry,
+      req.body.transaction?.type,
+      req.body.company?.location
+    ].filter(Boolean);
+
+    proposalData.tags = [...new Set([...autoTags, ...(req.body.tags || [])])];
+
+    const proposal = new Proposal(proposalData);
+    await proposal.save();
+
+    await proposal.populate('creator', 'email firstName lastName');
+
+    res.status(201).json(
+      ResponseFormatter.success(proposal, '提案創建成功', 201)
+    );
+  } catch (error) {
+    console.error('創建提案錯誤:', error);
+    
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(err => err.message);
+      return res.status(400).json(
+        ResponseFormatter.error('VALIDATION_ERROR', '資料驗證失敗', messages, 400)
+      );
+    }
+
+    res.status(500).json(
+      ResponseFormatter.error('CREATE_FAILED', '提案創建失敗', null, 500)
     );
   }
-  next();
-};
-
-// =========================
-// 提案 CRUD 操作
-// =========================
-
-// 創建提案 (提案方專用)
-router.post('/',
-  rateLimiters.api,
-  authenticateToken,
-  authorize('seller'),
-  [
-    body('title').trim().isLength({ min: 5, max: 200 }).withMessage('標題長度必須在5-200字符之間'),
-    body('industry').isIn([
-      'IT', 'Manufacturing', 'Finance', 'Healthcare', 'Education',
-      'Retail', 'Real Estate', 'Consulting', 'Marketing', 'Logistics',
-      'Energy', 'Entertainment', 'Food & Beverage', 'Automotive', 'Other'
-    ]).withMessage('請選擇有效的行業分類'),
-    body('summary').trim().isLength({ min: 10, max: 1000 }).withMessage('摘要長度必須在10-1000字符之間'),
-    body('description').trim().isLength({ min: 50, max: 10000 }).withMessage('描述長度必須在50-10000字符之間'),
-    body('targetMarket').trim().isLength({ min: 10, max: 1000 }).withMessage('目標市場描述必須在10-1000字符之間'),
-    body('financial.investmentRequired.amount').isFloat({ min: 0 }).withMessage('投資金額必須為正數'),
-    body('maInfo.dealType').isIn(['acquisition', 'merger', 'partnership', 'investment', 'joint_venture']).withMessage('請選擇有效的交易類型')
-  ],
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const proposalData = {
-        ...req.body,
-        sellerId: req.user._id,
-        status: 'draft'
-      };
-      
-      const proposal = new Proposal(proposalData);
-      await proposal.save();
-      
-      // 記錄操作日誌
-      await AuditLog.create({
-        userId: req.user._id,
-        action: 'CREATE_PROPOSAL',
-        resourceType: 'Proposal',
-        resourceId: proposal._id,
-        details: {
-          title: proposal.title,
-          industry: proposal.industry
-        }
-      });
-      
-      res.status(201).json(
-        ResponseFormatter.success(proposal, '提案創建成功')
-      );
-      
-    } catch (error) {
-      console.error('Create proposal error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '創建提案失敗', null, 500)
-      );
-    }
-  }
-);
+});
 
 // 獲取提案列表
-router.get('/',
-  rateLimiters.api,
-  authenticateToken,
-  [
-    query('page').optional().isInt({ min: 1 }).withMessage('頁碼必須為正整數'),
-    query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('每頁數量必須在1-100之間'),
-    query('status').optional().isIn(['draft', 'pending_review', 'approved', 'rejected', 'published', 'archived']),
-    query('industry').optional().isString(),
-    query('search').optional().isString().isLength({ max: 100 })
-  ],
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = parseInt(req.query.limit) || 10;
-      const skip = (page - 1) * limit;
-      
-      // 構建查詢條件
-      let query = {};
-      
-      // 根據用戶角色過濾
-      if (req.user.role === 'seller') {
-        query.sellerId = req.user._id;
-      } else if (req.user.role === 'buyer') {
-        query.status = 'published';
-        query['visibility.isPublic'] = true;
-      }
-      // admin 可以看到所有提案
-      
-      // 狀態過濾
-      if (req.query.status) {
-        query.status = req.query.status;
-      }
-      
-      // 行業過濾
-      if (req.query.industry) {
-        query.industry = req.query.industry;
-      }
-      
-      // 搜索功能
-      if (req.query.search) {
-        query.$text = { $search: req.query.search };
-      }
-      
-      // 執行查詢
-      const proposals = await Proposal.find(query)
-        .populate('sellerId', 'profile email')
-        .select('-description') // 列表不包含詳細描述
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit);
-      
-      const total = await Proposal.countDocuments(query);
-      
-      res.json(ResponseFormatter.success({
+router.get('/', authenticateToken, async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 10,
+      status,
+      industry,
+      creator,
+      search,
+      sortBy = 'createdAt',
+      sortOrder = 'desc'
+    } = req.query;
+
+    // 構建查詢條件
+    const query = {};
+
+    // 根據用戶角色限制查詢範圍
+    if (req.user.role === 'seller') {
+      query.creator = req.user._id;
+    } else if (req.user.role === 'buyer') {
+      // 買方只能看到已發佈的提案或發送給自己的提案
+      query.$or = [
+        { status: 'published' },
+        { 'targetBuyers.buyerId': req.user._id }
+      ];
+    }
+    // 管理員可以看到所有提案
+
+    // 狀態篩選
+    if (status) {
+      query.status = status;
+    }
+
+    // 行業篩選
+    if (industry) {
+      query.industry = industry;
+    }
+
+    // 創建者篩選（僅管理員）
+    if (creator && req.user.role === 'admin') {
+      query.creator = creator;
+    }
+
+    // 關鍵字搜尋
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { 'company.name': { $regex: search, $options: 'i' } },
+        { 'company.description': { $regex: search, $options: 'i' } },
+        { tags: { $in: [new RegExp(search, 'i')] } }
+      ];
+    }
+
+    // 排序設定
+    const sortOptions = {};
+    sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
+
+    // 分頁計算
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    // 執行查詢
+    const proposals = await Proposal.find(query)
+      .populate('creator', 'email firstName lastName')
+      .populate('targetBuyers.buyerId', 'email firstName lastName')
+      .populate('review.reviewedBy', 'email firstName lastName')
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Proposal.countDocuments(query);
+
+    // 分頁資訊
+    const pagination = {
+      currentPage: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+      totalItems: total,
+      itemsPerPage: parseInt(limit),
+      hasNextPage: skip + proposals.length < total,
+      hasPrevPage: parseInt(page) > 1
+    };
+
+    res.json(
+      ResponseFormatter.success({
         proposals,
-        pagination: {
-          page,
-          limit,
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      }, '提案列表獲取成功'));
-      
-    } catch (error) {
-      console.error('Get proposals error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '獲取提案列表失敗', null, 500)
+        pagination
+      }, '提案列表獲取成功')
+    );
+  } catch (error) {
+    console.error('獲取提案列表錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('FETCH_FAILED', '獲取提案列表失敗', null, 500)
+    );
+  }
+});
+
+// 獲取單個提案
+router.get('/:id', authenticateToken, async (req, res) => {
+  try {
+    const proposal = await Proposal.findById(req.params.id)
+      .populate('creator', 'email firstName lastName')
+      .populate('targetBuyers.buyerId', 'email firstName lastName')
+      .populate('review.reviewedBy', 'email firstName lastName');
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
       );
     }
-  }
-);
-// 獲取單個提案詳情 - 修復版
-router.get('/:id',
-  rateLimiters.api,
-  authenticateToken,
-  param('id').isMongoId().withMessage('無效的提案ID'),
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const proposal = await Proposal.findById(req.params.id)
-        .populate('sellerId', 'profile email contactInfo');
-      
-      if (!proposal) {
-        return res.status(404).json(
-          ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
-        );
-      }
-      
-      // 修復後的權限檢查邏輯
-      let canView = false;
-      
-      // 管理員可以查看所有提案
-      if (req.user.role === 'admin') {
-        canView = true;
-      }
-      // 提案方可以查看自己的提案 - 修復 ObjectId 比較
-      else if (proposal.sellerId) {
-        // 處理 populate 後的情況 (sellerId 是對象)
-        if (proposal.sellerId._id && proposal.sellerId._id.toString() === req.user._id.toString()) {
-          canView = true;
-        }
-        // 處理未 populate 的情況 (sellerId 是 ObjectId)
-        else if (proposal.sellerId.toString() === req.user._id.toString()) {
-          canView = true;
-        }
-      }
-      // 已發布的提案買方可以查看
-      if (!canView && proposal.status === 'published' && req.user.role === 'buyer') {
-        if (proposal.visibility.isPublic) {
-          canView = true;
-        } else if (proposal.visibility.allowedBuyers.includes(req.user._id)) {
-          canView = true;
-        }
-      }
-      
-      if (!canView) {
-        return res.status(403).json(
-          ResponseFormatter.error('FORBIDDEN', '無權查看此提案', null, 403)
-        );
-      }
-      
-      // 如果是買方查看，記錄瀏覽
-      if (req.user.role === 'buyer' && proposal.status === 'published') {
-        proposal.statistics.views += 1;
+
+    // 權限檢查
+    const canView = 
+      req.user.role === 'admin' ||
+      proposal.isOwner(req.user._id) ||
+      (req.user.role === 'buyer' && (
+        proposal.status === 'published' ||
+        proposal.targetBuyers.some(tb => tb.buyerId.toString() === req.user._id.toString())
+      ));
+
+    if (!canView) {
+      return res.status(403).json(
+        ResponseFormatter.error('ACCESS_DENIED', '無權限查看此提案', null, 403)
+      );
+    }
+
+    // 如果是買方查看，記錄查看狀態
+    if (req.user.role === 'buyer') {
+      const buyerRecord = proposal.targetBuyers.find(
+        tb => tb.buyerId.toString() === req.user._id.toString()
+      );
+      if (buyerRecord && buyerRecord.status === 'sent') {
+        buyerRecord.status = 'viewed';
         await proposal.save();
-        
-        // 檢查是否已有發送記錄
-        let submission = await ProposalSubmission.findOne({
-          proposalId: proposal._id,
-          buyerId: req.user._id
+      }
+    }
+
+    res.json(
+      ResponseFormatter.success(proposal, '提案詳情獲取成功')
+    );
+  } catch (error) {
+    console.error('獲取提案詳情錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('FETCH_FAILED', '獲取提案詳情失敗', null, 500)
+    );
+  }
+});
+
+// 更新提案
+router.put('/:id', authenticateToken, authorize('seller'), async (req, res) => {
+  try {
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
+      );
+    }
+
+    // 權限檢查：只有創建者可以修改
+    if (!proposal.isOwner(req.user._id)) {
+      return res.status(403).json(
+        ResponseFormatter.error('ACCESS_DENIED', '只有提案創建者可以修改', null, 403)
+      );
+    }
+
+    // 狀態檢查：只有草稿和已拒絕的提案可以修改
+    if (!proposal.canEdit()) {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_STATUS', '當前狀態不允許修改', null, 400)
+      );
+    }
+
+    // 更新資料
+    Object.assign(proposal, req.body);
+    
+    // 如果是從拒絕狀態修改，重置為草稿
+    if (proposal.status === 'rejected') {
+      proposal.status = 'draft';
+      proposal.review = {};
+    }
+
+    await proposal.save();
+    await proposal.populate('creator', 'email firstName lastName');
+
+    res.json(
+      ResponseFormatter.success(proposal, '提案更新成功')
+    );
+  } catch (error) {
+    console.error('更新提案錯誤:', error);
+    
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(err => err.message);
+      return res.status(400).json(
+        ResponseFormatter.error('VALIDATION_ERROR', '資料驗證失敗', messages, 400)
+      );
+    }
+
+    res.status(500).json(
+      ResponseFormatter.error('UPDATE_FAILED', '提案更新失敗', null, 500)
+    );
+  }
+});
+
+// 刪除提案（僅草稿）
+router.delete('/:id', authenticateToken, authorize('seller'), async (req, res) => {
+  try {
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
+      );
+    }
+
+    // 權限檢查
+    if (!proposal.isOwner(req.user._id)) {
+      return res.status(403).json(
+        ResponseFormatter.error('ACCESS_DENIED', '只有提案創建者可以刪除', null, 403)
+      );
+    }
+
+    // 只能刪除草稿狀態的提案
+    if (proposal.status !== 'draft') {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_STATUS', '只能刪除草稿狀態的提案', null, 400)
+      );
+    }
+
+    await Proposal.findByIdAndDelete(req.params.id);
+
+    res.json(
+      ResponseFormatter.success(null, '提案刪除成功')
+    );
+  } catch (error) {
+    console.error('刪除提案錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('DELETE_FAILED', '提案刪除失敗', null, 500)
+    );
+  }
+});
+
+// ===========================================
+// 狀態管理操作
+// ===========================================
+
+// 提交審核
+router.post('/:id/submit', authenticateToken, authorize('seller'), async (req, res) => {
+  try {
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
+      );
+    }
+
+    if (!proposal.isOwner(req.user._id)) {
+      return res.status(403).json(
+        ResponseFormatter.error('ACCESS_DENIED', '只有提案創建者可以提交審核', null, 403)
+      );
+    }
+
+    if (!proposal.canSubmit()) {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_STATUS', '當前狀態不允許提交審核', null, 400)
+      );
+    }
+
+    proposal.status = 'pending_review';
+    proposal.submittedAt = new Date();
+    await proposal.save();
+
+    res.json(
+      ResponseFormatter.success(proposal, '提案已提交審核')
+    );
+  } catch (error) {
+    console.error('提交審核錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('SUBMIT_FAILED', '提交審核失敗', null, 500)
+    );
+  }
+});
+
+// 管理員審核（核准）
+router.post('/:id/approve', authenticateToken, authorize('admin'), async (req, res) => {
+  try {
+    const { comments } = req.body;
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
+      );
+    }
+
+    if (!proposal.canApprove()) {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_STATUS', '當前狀態不允許審核', null, 400)
+      );
+    }
+
+    proposal.status = 'approved';
+    proposal.approvedAt = new Date();
+    proposal.review = {
+      reviewedBy: req.user._id,
+      reviewedAt: new Date(),
+      comments: comments || '',
+      action: 'approved'
+    };
+
+    await proposal.save();
+    await proposal.populate('creator', 'email firstName lastName');
+
+    res.json(
+      ResponseFormatter.success(proposal, '提案審核通過')
+    );
+  } catch (error) {
+    console.error('審核通過錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('APPROVE_FAILED', '審核通過失敗', null, 500)
+    );
+  }
+});
+
+// 管理員審核（拒絕）
+router.post('/:id/reject', authenticateToken, authorize('admin'), async (req, res) => {
+  try {
+    const { comments } = req.body;
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
+      );
+    }
+
+    if (!proposal.canApprove()) {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_STATUS', '當前狀態不允許審核', null, 400)
+      );
+    }
+
+    proposal.status = 'rejected';
+    proposal.review = {
+      reviewedBy: req.user._id,
+      reviewedAt: new Date(),
+      comments: comments || '',
+      action: 'rejected'
+    };
+
+    await proposal.save();
+    await proposal.populate('creator', 'email firstName lastName');
+
+    res.json(
+      ResponseFormatter.success(proposal, '提案已拒絕')
+    );
+  } catch (error) {
+    console.error('審核拒絕錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('REJECT_FAILED', '審核拒絕失敗', null, 500)
+    );
+  }
+});
+
+// 發送給買方
+router.post('/:id/send-to-buyers', authenticateToken, authorize('seller'), async (req, res) => {
+  try {
+    const { buyerIds } = req.body;
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
+      );
+    }
+
+    if (!proposal.isOwner(req.user._id)) {
+      return res.status(403).json(
+        ResponseFormatter.error('ACCESS_DENIED', '只有提案創建者可以發送', null, 403)
+      );
+    }
+
+    if (!proposal.canPublish()) {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_STATUS', '只能發送已核准的提案', null, 400)
+      );
+    }
+
+    // 驗證買方存在且為買方角色
+    const buyers = await User.find({
+      _id: { $in: buyerIds },
+      role: 'buyer',
+      isActive: true
+    });
+
+    if (buyers.length !== buyerIds.length) {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_BUYERS', '部分買方不存在或無效', null, 400)
+      );
+    }
+
+    // 添加目標買方
+    buyerIds.forEach(buyerId => {
+      const existingBuyer = proposal.targetBuyers.find(
+        tb => tb.buyerId.toString() === buyerId.toString()
+      );
+      
+      if (!existingBuyer) {
+        proposal.targetBuyers.push({
+          buyerId,
+          sentAt: new Date(),
+          status: 'sent'
         });
-        
-        if (submission) {
-          await submission.addInteraction('view');
-        }
       }
-      
-      res.json(ResponseFormatter.success(proposal, '提案詳情獲取成功'));
-      
-    } catch (error) {
-      console.error('Get proposal error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '獲取提案詳情失敗', null, 500)
+    });
+
+    proposal.status = 'published';
+    proposal.publishedAt = new Date();
+    await proposal.save();
+
+    res.json(
+      ResponseFormatter.success(proposal, `提案已發送給 ${buyerIds.length} 位買方`)
+    );
+  } catch (error) {
+    console.error('發送提案錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('SEND_FAILED', '發送提案失敗', null, 500)
+    );
+  }
+});
+
+// ===========================================
+// 買方互動操作
+// ===========================================
+
+// 買方回應提案
+router.post('/:id/respond', authenticateToken, authorize('buyer'), async (req, res) => {
+  try {
+    const { status, response } = req.body;
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
       );
     }
-  }
-);
 
-// 更新提案 (提案方專用)
-router.put('/:id',
-  rateLimiters.api,
-  authenticateToken,
-  authorize('seller'),
-  param('id').isMongoId().withMessage('無效的提案ID'),
-  [
-    body('title').optional().trim().isLength({ min: 5, max: 200 }),
-    body('industry').optional().isIn(['IT', 'Manufacturing', 'Finance', 'Healthcare', 'Education', 'Retail', 'Real Estate', 'Consulting', 'Marketing', 'Logistics', 'Energy', 'Entertainment', 'Food & Beverage', 'Automotive', 'Other']),
-    body('summary').optional().trim().isLength({ min: 10, max: 1000 }),
-    body('description').optional().trim().isLength({ min: 50, max: 10000 })
-  ],
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const proposal = await Proposal.findById(req.params.id);
-      
-      if (!proposal) {
-        return res.status(404).json(
-          ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
-        );
-      }
-      
-      // 檢查所有權
-      if (proposal.sellerId.toString() !== req.user._id.toString()) {
-        return res.status(403).json(
-          ResponseFormatter.error('FORBIDDEN', '無權修改此提案', null, 403)
-        );
-      }
-      
-      // 檢查是否可以編輯
-      if (!['draft', 'rejected'].includes(proposal.status)) {
-        return res.status(400).json(
-          ResponseFormatter.error('INVALID_STATUS', '當前狀態下無法編輯提案', null, 400)
-        );
-      }
-      
-      // 更新提案
-      Object.assign(proposal, req.body);
-      await proposal.save();
-      
-      // 記錄操作日誌
-      await AuditLog.create({
-        userId: req.user._id,
-        action: 'UPDATE_PROPOSAL',
-        resourceType: 'Proposal',
-        resourceId: proposal._id,
-        details: {
-          title: proposal.title,
-          updatedFields: Object.keys(req.body)
-        }
-      });
-      
-      res.json(ResponseFormatter.success(proposal, '提案更新成功'));
-      
-    } catch (error) {
-      console.error('Update proposal error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '更新提案失敗', null, 500)
+    // 檢查買方是否為目標買方
+    const buyerRecord = proposal.targetBuyers.find(
+      tb => tb.buyerId.toString() === req.user._id.toString()
+    );
+
+    if (!buyerRecord) {
+      return res.status(403).json(
+        ResponseFormatter.error('ACCESS_DENIED', '您不是此提案的目標買方', null, 403)
       );
     }
-  }
-);
 
-// 刪除提案 (提案方專用)
-router.delete('/:id',
-  rateLimiters.api,
-  authenticateToken,
-  authorize('seller'),
-  param('id').isMongoId().withMessage('無效的提案ID'),
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const proposal = await Proposal.findById(req.params.id);
-      
-      if (!proposal) {
-        return res.status(404).json(
-          ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
-        );
-      }
-      
-      // 檢查所有權
-      if (proposal.sellerId.toString() !== req.user._id.toString()) {
-        return res.status(403).json(
-          ResponseFormatter.error('FORBIDDEN', '無權刪除此提案', null, 403)
-        );
-      }
-      
-      // 只有草稿狀態才能刪除
-      if (proposal.status !== 'draft') {
-        return res.status(400).json(
-          ResponseFormatter.error('INVALID_STATUS', '只有草稿狀態的提案才能刪除', null, 400)
-        );
-      }
-      
-      await Proposal.findByIdAndDelete(req.params.id);
-      
-      // 記錄操作日誌
-      await AuditLog.create({
-        userId: req.user._id,
-        action: 'DELETE_PROPOSAL',
-        resourceType: 'Proposal',
-        resourceId: proposal._id,
-        details: {
-          title: proposal.title
-        }
-      });
-      
-      res.json(ResponseFormatter.success(null, '提案刪除成功'));
-      
-    } catch (error) {
-      console.error('Delete proposal error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '刪除提案失敗', null, 500)
-      );
+    // 更新買方回應
+    buyerRecord.status = status;
+    buyerRecord.response = response || '';
+    buyerRecord.responseAt = new Date();
+
+    await proposal.save();
+
+    res.json(
+      ResponseFormatter.success(buyerRecord, '回應已記錄')
+    );
+  } catch (error) {
+    console.error('買方回應錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('RESPOND_FAILED', '回應失敗', null, 500)
+    );
+  }
+});
+
+// 獲取買方收到的提案
+router.get('/received/inbox', authenticateToken, authorize('buyer'), async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 10,
+      status,
+      industry,
+      sortBy = 'sentAt',
+      sortOrder = 'desc'
+    } = req.query;
+
+    const query = {
+      'targetBuyers.buyerId': req.user._id
+    };
+
+    if (status) {
+      query['targetBuyers.status'] = status;
     }
-  }
-);
 
-// =========================
-// 提案狀態管理
-// =========================
-
-// 提交審核 (提案方專用)
-router.post('/:id/submit',
-  rateLimiters.api,
-  authenticateToken,
-  authorize('seller'),
-  param('id').isMongoId().withMessage('無效的提案ID'),
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const proposal = await Proposal.findById(req.params.id);
-      
-      if (!proposal) {
-        return res.status(404).json(
-          ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
-        );
-      }
-      
-      // 檢查所有權
-      if (proposal.sellerId.toString() !== req.user._id.toString()) {
-        return res.status(403).json(
-          ResponseFormatter.error('FORBIDDEN', '無權操作此提案', null, 403)
-        );
-      }
-      
-      // 檢查當前狀態
-      if (!['draft', 'rejected'].includes(proposal.status)) {
-        return res.status(400).json(
-          ResponseFormatter.error('INVALID_STATUS', '當前狀態下無法提交審核', null, 400)
-        );
-      }
-      
-      // 驗證提案完整性
-      const requiredFields = ['title', 'summary', 'description', 'targetMarket', 'financial.investmentRequired.amount', 'maInfo.dealType'];
-      const missingFields = [];
-      
-      requiredFields.forEach(field => {
-        const value = field.split('.').reduce((obj, key) => obj?.[key], proposal);
-        if (!value) missingFields.push(field);
-      });
-      
-      if (missingFields.length > 0) {
-        return res.status(400).json(
-          ResponseFormatter.error('INCOMPLETE_PROPOSAL', '提案資訊不完整', { missingFields }, 400)
-        );
-      }
-      
-      await proposal.updateStatus('pending_review');
-      
-      // 記錄操作日誌
-      await AuditLog.create({
-        userId: req.user._id,
-        action: 'SUBMIT_PROPOSAL',
-        resourceType: 'Proposal',
-        resourceId: proposal._id,
-        details: {
-          title: proposal.title
-        }
-      });
-      
-      res.json(ResponseFormatter.success(proposal, '提案已提交審核'));
-      
-    } catch (error) {
-      console.error('Submit proposal error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '提交審核失敗', null, 500)
-      );
+    if (industry) {
+      query.industry = industry;
     }
-  }
-);
 
-// =========================
-// 管理員審核功能
-// =========================
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const sortOptions = {};
+    sortOptions[`targetBuyers.${sortBy}`] = sortOrder === 'desc' ? -1 : 1;
 
-// 獲取待審核提案列表 (管理員專用)
-router.get('/admin/pending',
-  rateLimiters.api,
-  authenticateToken,
-  authorize('admin'),
-  [
-    query('page').optional().isInt({ min: 1 }),
-    query('limit').optional().isInt({ min: 1, max: 100 })
-  ],
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = parseInt(req.query.limit) || 10;
-      const skip = (page - 1) * limit;
-      
-      const proposals = await Proposal.find({ status: 'pending_review' })
-        .populate('sellerId', 'profile email')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit);
-      
-      const total = await Proposal.countDocuments({ status: 'pending_review' });
-      
-      res.json(ResponseFormatter.success({
-        proposals,
-        pagination: {
-          page,
-          limit,
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      }, '待審核提案列表獲取成功'));
-      
-    } catch (error) {
-      console.error('Get pending proposals error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '獲取待審核提案失敗', null, 500)
-      );
-    }
-  }
-);
+    const proposals = await Proposal.find(query)
+      .populate('creator', 'email firstName lastName')
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit));
 
-// 審核提案 (管理員專用)
-router.post('/:id/review',
-  rateLimiters.api,
-  authenticateToken,
-  authorize('admin'),
-  param('id').isMongoId().withMessage('無效的提案ID'),
-  [
-    body('action').isIn(['approve', 'reject']).withMessage('審核動作必須是 approve 或 reject'),
-    body('comments').optional().isString().isLength({ max: 1000 }).withMessage('審核意見最多1000字符'),
-    body('rejectionReason').if(body('action').equals('reject')).notEmpty().withMessage('拒絕時必須提供原因')
-  ],
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const proposal = await Proposal.findById(req.params.id);
-      
-      if (!proposal) {
-        return res.status(404).json(
-          ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
-        );
-      }
-      
-      if (proposal.status !== 'pending_review') {
-        return res.status(400).json(
-          ResponseFormatter.error('INVALID_STATUS', '提案不在待審核狀態', null, 400)
-        );
-      }
-      
-      const { action, comments, rejectionReason } = req.body;
-      const newStatus = action === 'approve' ? 'approved' : 'rejected';
-      
-      await proposal.updateStatus(newStatus, {
-        reviewedBy: req.user._id,
-        reviewComments: comments,
-        rejectionReason: action === 'reject' ? rejectionReason : undefined
-      });
-      
-      // 記錄操作日誌
-      await AuditLog.create({
-        userId: req.user._id,
-        action: action === 'approve' ? 'APPROVE_PROPOSAL' : 'REJECT_PROPOSAL',
-        resourceType: 'Proposal',
-        resourceId: proposal._id,
-        details: {
-          title: proposal.title,
-          comments,
-          rejectionReason
-        }
-      });
-      
-      res.json(ResponseFormatter.success(proposal, `提案已${action === 'approve' ? '通過' : '拒絕'}審核`));
-      
-    } catch (error) {
-      console.error('Review proposal error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '審核提案失敗', null, 500)
-      );
-    }
-  }
-);
-
-// 發布提案 (管理員或提案方)
-router.post('/:id/publish',
-  rateLimiters.api,
-  authenticateToken,
-  param('id').isMongoId().withMessage('無效的提案ID'),
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const proposal = await Proposal.findById(req.params.id);
-      
-      if (!proposal) {
-        return res.status(404).json(
-          ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
-        );
-      }
-      
-      // 檢查權限
-      const canPublish = req.user.role === 'admin' || 
-        (req.user.role === 'seller' && proposal.sellerId.toString() === req.user._id.toString());
-      
-      if (!canPublish) {
-        return res.status(403).json(
-          ResponseFormatter.error('FORBIDDEN', '無權發布此提案', null, 403)
-        );
-      }
-      
-      // 檢查狀態
-      if (proposal.status !== 'approved') {
-        return res.status(400).json(
-          ResponseFormatter.error('INVALID_STATUS', '只有已審核通過的提案才能發布', null, 400)
-        );
-      }
-      
-      await proposal.updateStatus('published');
-      
-      // 記錄操作日誌
-      await AuditLog.create({
-        userId: req.user._id,
-        action: 'PUBLISH_PROPOSAL',
-        resourceType: 'Proposal',
-        resourceId: proposal._id,
-        details: {
-          title: proposal.title
-        }
-      });
-      
-      res.json(ResponseFormatter.success(proposal, '提案已發布'));
-      
-    } catch (error) {
-      console.error('Publish proposal error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '發布提案失敗', null, 500)
-      );
-    }
-  }
-);
-
-// =========================
-// 搜索和篩選功能
-// =========================
-
-// 高級搜索
-router.post('/search',
-  rateLimiters.api,
-  authenticateToken,
-  [
-    body('query').optional().isString().isLength({ max: 100 }),
-    body('filters.industry').optional().isArray(),
-    body('filters.dealType').optional().isArray(),
-    body('filters.investmentRange.min').optional().isFloat({ min: 0 }),
-    body('filters.investmentRange.max').optional().isFloat({ min: 0 }),
-    body('filters.tags').optional().isArray(),
-    body('sort').optional().isIn(['newest', 'oldest', 'investment_asc', 'investment_desc', 'relevance']),
-    body('page').optional().isInt({ min: 1 }),
-    body('limit').optional().isInt({ min: 1, max: 100 })
-  ],
-  handleValidationErrors,
-  async (req, res) => {
-    try {
-      const {
-        query: searchQuery,
-        filters = {},
-        sort = 'newest',
-        page = 1,
-        limit = 10
-      } = req.body;
-      
-      const skip = (page - 1) * limit;
-      
-      // 構建查詢條件
-      let mongoQuery = {};
-      
-      // 基礎權限過濾
-      if (req.user.role === 'buyer') {
-        mongoQuery.status = 'published';
-        mongoQuery['visibility.isPublic'] = true;
-      } else if (req.user.role === 'seller') {
-        mongoQuery.sellerId = req.user._id;
-      }
-      
-      // 文本搜索
-      if (searchQuery) {
-        mongoQuery.$text = { $search: searchQuery };
-      }
-      
-      // 行業過濾
-      if (filters.industry && filters.industry.length > 0) {
-        mongoQuery.industry = { $in: filters.industry };
-      }
-      
-      // 交易類型過濾
-      if (filters.dealType && filters.dealType.length > 0) {
-        mongoQuery['maInfo.dealType'] = { $in: filters.dealType };
-      }
-      
-      // 投資金額範圍
-      if (filters.investmentRange) {
-        const investmentFilter = {};
-        if (filters.investmentRange.min) {
-          investmentFilter.$gte = filters.investmentRange.min;
-        }
-        if (filters.investmentRange.max) {
-          investmentFilter.$lte = filters.investmentRange.max;
-        }
-        if (Object.keys(investmentFilter).length > 0) {
-          mongoQuery['financial.investmentRequired.amount'] = investmentFilter;
-        }
-      }
-      
-      // 標籤過濾
-      if (filters.tags && filters.tags.length > 0) {
-        mongoQuery.tags = { $in: filters.tags };
-      }
-      
-      // 構建排序
-      let sortQuery = {};
-      switch (sort) {
-        case 'newest':
-          sortQuery = { createdAt: -1 };
-          break;
-        case 'oldest':
-          sortQuery = { createdAt: 1 };
-          break;
-        case 'investment_asc':
-          sortQuery = { 'financial.investmentRequired.amount': 1 };
-          break;
-        case 'investment_desc':
-          sortQuery = { 'financial.investmentRequired.amount': -1 };
-          break;
-        case 'relevance':
-          if (searchQuery) {
-            sortQuery = { score: { $meta: 'textScore' } };
-          } else {
-            sortQuery = { createdAt: -1 };
-          }
-          break;
-        default:
-          sortQuery = { createdAt: -1 };
-      }
-      
-      // 執行查詢
-      const proposals = await Proposal.find(mongoQuery)
-        .populate('sellerId', 'profile email')
-        .select(req.user.role === 'buyer' ? '-description' : '')
-        .sort(sortQuery)
-        .skip(skip)
-        .limit(limit);
-      
-      const total = await Proposal.countDocuments(mongoQuery);
-      
-      res.json(ResponseFormatter.success({
-        proposals,
-        searchQuery,
-        filters,
-        pagination: {
-          page,
-          limit,
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      }, '搜索完成'));
-      
-    } catch (error) {
-      console.error('Search proposals error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '搜索失敗', null, 500)
-      );
-    }
-  }
-);
-
-// 獲取搜索過濾選項
-router.get('/search/filters',
-  rateLimiters.api,
-  authenticateToken,
-  async (req, res) => {
-    try {
-      // 獲取所有可用的行業選項
-      const industries = await Proposal.distinct('industry', 
-        req.user.role === 'buyer' ? { status: 'published' } : {}
+    // 過濾出當前買方的記錄
+    const formattedProposals = proposals.map(proposal => {
+      const buyerRecord = proposal.targetBuyers.find(
+        tb => tb.buyerId.toString() === req.user._id.toString()
       );
       
-      // 獲取所有可用的交易類型
-      const dealTypes = await Proposal.distinct('maInfo.dealType',
-        req.user.role === 'buyer' ? { status: 'published' } : {}
-      );
-      
-      // 獲取投資金額範圍
-      const investmentStats = await Proposal.aggregate([
-        ...(req.user.role === 'buyer' ? [{ $match: { status: 'published' } }] : []),
-        {
-          $group: {
-            _id: null,
-            minInvestment: { $min: '$financial.investmentRequired.amount' },
-            maxInvestment: { $max: '$financial.investmentRequired.amount' },
-            avgInvestment: { $avg: '$financial.investmentRequired.amount' }
-          }
-        }
-      ]);
-      
-      // 獲取熱門標籤
-      const popularTags = await Proposal.aggregate([
-        ...(req.user.role === 'buyer' ? [{ $match: { status: 'published' } }] : []),
-        { $unwind: '$tags' },
-        { $group: { _id: '$tags', count: { $sum: 1 } } },
-        { $sort: { count: -1 } },
-        { $limit: 20 }
-      ]);
-      
-      const filterOptions = {
-        industries: industries.sort(),
-        dealTypes: dealTypes.sort(),
-        investmentRange: investmentStats[0] || { minInvestment: 0, maxInvestment: 0, avgInvestment: 0 },
-        popularTags: popularTags.map(tag => ({
-          name: tag._id,
-          count: tag.count
-        }))
+      return {
+        ...proposal.toObject(),
+        buyerStatus: buyerRecord?.status,
+        sentAt: buyerRecord?.sentAt,
+        responseAt: buyerRecord?.responseAt,
+        myResponse: buyerRecord?.response
       };
-      
-      res.json(ResponseFormatter.success(filterOptions, '搜索過濾選項獲取成功'));
-      
-    } catch (error) {
-      console.error('Get filter options error:', error);
-      res.status(500).json(
-        ResponseFormatter.error('SERVER_ERROR', '獲取過濾選項失敗', null, 500)
+    });
+
+    const total = await Proposal.countDocuments(query);
+
+    const pagination = {
+      currentPage: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+      totalItems: total,
+      itemsPerPage: parseInt(limit),
+      hasNextPage: skip + proposals.length < total,
+      hasPrevPage: parseInt(page) > 1
+    };
+
+    res.json(
+      ResponseFormatter.success({
+        proposals: formattedProposals,
+        pagination
+      }, '收件箱獲取成功')
+    );
+  } catch (error) {
+    console.error('獲取收件箱錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('FETCH_FAILED', '獲取收件箱失敗', null, 500)
+    );
+  }
+});
+
+// ===========================================
+// 刪除申請功能
+// ===========================================
+
+// 申請刪除提案
+router.post('/:id/request-delete', authenticateToken, authorize('seller'), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
       );
     }
+
+    if (!proposal.isOwner(req.user._id)) {
+      return res.status(403).json(
+        ResponseFormatter.error('ACCESS_DENIED', '只有提案創建者可以申請刪除', null, 403)
+      );
+    }
+
+    if (proposal.status !== 'published') {
+      return res.status(400).json(
+        ResponseFormatter.error('INVALID_STATUS', '只能申請刪除已發佈的提案', null, 400)
+      );
+    }
+
+    if (proposal.deleteRequest.requested) {
+      return res.status(400).json(
+        ResponseFormatter.error('ALREADY_REQUESTED', '已經申請過刪除', null, 400)
+      );
+    }
+
+    proposal.deleteRequest = {
+      requested: true,
+      requestedAt: new Date(),
+      reason: reason || ''
+    };
+
+    await proposal.save();
+
+    res.json(
+      ResponseFormatter.success(proposal.deleteRequest, '刪除申請已提交')
+    );
+  } catch (error) {
+    console.error('申請刪除錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('REQUEST_FAILED', '申請刪除失敗', null, 500)
+    );
   }
-);
+});
+
+// 管理員處理刪除申請
+router.post('/:id/approve-delete', authenticateToken, authorize('admin'), async (req, res) => {
+  try {
+    const proposal = await Proposal.findById(req.params.id);
+
+    if (!proposal) {
+      return res.status(404).json(
+        ResponseFormatter.error('NOT_FOUND', '提案不存在', null, 404)
+      );
+    }
+
+    if (!proposal.deleteRequest.requested) {
+      return res.status(400).json(
+        ResponseFormatter.error('NO_REQUEST', '沒有刪除申請', null, 400)
+      );
+    }
+
+    proposal.deleteRequest.approvedBy = req.user._id;
+    proposal.deleteRequest.deletedAt = new Date();
+    await proposal.save();
+
+    // 實際刪除提案
+    await Proposal.findByIdAndDelete(req.params.id);
+
+    res.json(
+      ResponseFormatter.success(null, '提案刪除申請已核准並執行')
+    );
+  } catch (error) {
+    console.error('核准刪除錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('APPROVE_DELETE_FAILED', '核准刪除失敗', null, 500)
+    );
+  }
+});
+
+// ===========================================
+// 搜尋與工具功能
+// ===========================================
+
+// 搜尋提案
+router.get('/search/advanced', authenticateToken, async (req, res) => {
+  try {
+    const {
+      keyword,
+      industry,
+      transactionType,
+      valuationMin,
+      valuationMax,
+      revenueMin,
+      revenueMax,
+      growthRateMin,
+      growthRateMax,
+      employeeRange,
+      location,
+      page = 1,
+      limit = 10
+    } = req.query;
+
+    const query = {};
+
+    // 角色權限限制
+    if (req.user.role === 'buyer') {
+      query.status = 'published';
+    } else if (req.user.role === 'seller') {
+      query.creator = req.user._id;
+    }
+
+    // 關鍵字搜尋
+    if (keyword) {
+      query.$or = [
+        { title: { $regex: keyword, $options: 'i' } },
+        { 'company.name': { $regex: keyword, $options: 'i' } },
+        { 'company.description': { $regex: keyword, $options: 'i' } },
+        { executiveSummary: { $regex: keyword, $options: 'i' } },
+        { tags: { $in: [new RegExp(keyword, 'i')] } }
+      ];
+    }
+
+    // 行業篩選
+    if (industry) {
+      query.industry = industry;
+    }
+
+    // 交易類型篩選
+    if (transactionType) {
+      query['transaction.type'] = transactionType;
+    }
+
+    // 估值範圍篩選
+    if (valuationMin || valuationMax) {
+      query['transaction.targetValuation.min'] = {};
+      if (valuationMin) {
+        query['transaction.targetValuation.min'].$gte = parseInt(valuationMin);
+      }
+      if (valuationMax) {
+        query['transaction.targetValuation.max'] = { $lte: parseInt(valuationMax) };
+      }
+    }
+
+    // 營收範圍篩選
+    if (revenueMin || revenueMax) {
+      query['financial.annualRevenue.amount'] = {};
+      if (revenueMin) {
+        query['financial.annualRevenue.amount'].$gte = parseInt(revenueMin);
+      }
+      if (revenueMax) {
+        query['financial.annualRevenue.amount'].$lte = parseInt(revenueMax);
+      }
+    }
+
+    // 成長率篩選
+    if (growthRateMin || growthRateMax) {
+      query['financial.growthRate'] = {};
+      if (growthRateMin) {
+        query['financial.growthRate'].$gte = parseFloat(growthRateMin);
+      }
+      if (growthRateMax) {
+        query['financial.growthRate'].$lte = parseFloat(growthRateMax);
+      }
+    }
+
+    // 員工規模篩選
+    if (employeeRange) {
+      query['company.employees'] = employeeRange;
+    }
+
+    // 地點篩選
+    if (location) {
+      query['company.location'] = { $regex: location, $options: 'i' };
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const proposals = await Proposal.find(query)
+      .populate('creator', 'email firstName lastName')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Proposal.countDocuments(query);
+
+    const pagination = {
+      currentPage: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+      totalItems: total,
+      itemsPerPage: parseInt(limit),
+      hasNextPage: skip + proposals.length < total,
+      hasPrevPage: parseInt(page) > 1
+    };
+
+    res.json(
+      ResponseFormatter.success({
+        proposals,
+        pagination,
+        searchCriteria: req.query
+      }, '搜尋完成')
+    );
+  } catch (error) {
+    console.error('搜尋錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('SEARCH_FAILED', '搜尋失敗', null, 500)
+    );
+  }
+});
+
+// 獲取買方列表（用於選擇目標買方）
+router.get('/buyers/list', authenticateToken, authorize('seller'), async (req, res) => {
+  try {
+    const { page = 1, limit = 50, search } = req.query;
+
+    const query = {
+      role: 'buyer',
+      isActive: true
+    };
+
+    if (search) {
+      query.$or = [
+        { email: { $regex: search, $options: 'i' } },
+        { firstName: { $regex: search, $options: 'i' } },
+        { lastName: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const buyers = await User.find(query)
+      .select('email firstName lastName createdAt')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await User.countDocuments(query);
+
+    const pagination = {
+      currentPage: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+      totalItems: total,
+      itemsPerPage: parseInt(limit),
+      hasNextPage: skip + buyers.length < total,
+      hasPrevPage: parseInt(page) > 1
+    };
+
+    res.json(
+      ResponseFormatter.success({
+        buyers,
+        pagination
+      }, '買方列表獲取成功')
+    );
+  } catch (error) {
+    console.error('獲取買方列表錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('FETCH_FAILED', '獲取買方列表失敗', null, 500)
+    );
+  }
+});
+
+// 獲取選項資料（用於前端表單）
+router.get('/options/all', (req, res) => {
+  try {
+    const options = {
+      industries: Proposal.getIndustries(),
+      employeeRanges: Proposal.getEmployeeRanges(),
+      transactionTypes: Proposal.getTransactionTypes(),
+      valuationRanges: Proposal.getValuationRanges(),
+      statusOptions: Proposal.getStatusOptions()
+    };
+
+    res.json(
+      ResponseFormatter.success(options, '選項資料獲取成功')
+    );
+  } catch (error) {
+    console.error('獲取選項資料錯誤:', error);
+    res.status(500).json(
+      ResponseFormatter.error('FETCH_FAILED', '獲取選項資料失敗', null, 500)
+    );
+  }
+});
 
 module.exports = router;
