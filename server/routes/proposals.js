@@ -170,14 +170,40 @@ router.get('/:id', authenticateToken, async (req, res) => {
       );
     }
 
-    // 權限檢查
-    const canView = 
-      req.user.role === 'admin' ||
-      proposal.isOwner(req.user._id) ||
-      (req.user.role === 'buyer' && (
-        proposal.status === 'published' ||
-        proposal.targetBuyers.some(tb => tb.buyerId.toString() === req.user._id.toString())
-      ));
+    // 修復權限檢查邏輯
+    let canView = false;
+
+    // 管理員可以查看所有提案
+    if (req.user.role === 'admin') {
+      canView = true;
+    }
+    // 檢查是否為提案創建者 - 處理 populate 的情況
+    else if (proposal.creator) {
+      // 如果 creator 被 populate 了（是物件）
+      if (proposal.creator._id) {
+        canView = proposal.creator._id.toString() === req.user._id.toString();
+      }
+      // 如果 creator 沒有被 populate（是 ObjectId）
+      else {
+        canView = proposal.creator.toString() === req.user._id.toString();
+      }
+    }
+    // 買方權限檢查
+    else if (req.user.role === 'buyer') {
+      if (proposal.status === 'published') {
+        canView = true;
+      } else {
+        // 檢查是否為目標買方
+        canView = proposal.targetBuyers.some(tb => {
+          if (tb.buyerId && tb.buyerId._id) {
+            return tb.buyerId._id.toString() === req.user._id.toString();
+          } else if (tb.buyerId) {
+            return tb.buyerId.toString() === req.user._id.toString();
+          }
+          return false;
+        });
+      }
+    }
 
     if (!canView) {
       return res.status(403).json(
@@ -187,9 +213,15 @@ router.get('/:id', authenticateToken, async (req, res) => {
 
     // 如果是買方查看，記錄查看狀態
     if (req.user.role === 'buyer') {
-      const buyerRecord = proposal.targetBuyers.find(
-        tb => tb.buyerId.toString() === req.user._id.toString()
-      );
+      const buyerRecord = proposal.targetBuyers.find(tb => {
+        if (tb.buyerId && tb.buyerId._id) {
+          return tb.buyerId._id.toString() === req.user._id.toString();
+        } else if (tb.buyerId) {
+          return tb.buyerId.toString() === req.user._id.toString();
+        }
+        return false;
+      });
+      
       if (buyerRecord && buyerRecord.status === 'sent') {
         buyerRecord.status = 'viewed';
         await proposal.save();
